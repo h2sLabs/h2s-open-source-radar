@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.venv-build/
+venv/
+
+# Build
+build/
+dist/
+*.spec.bak
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# Local/runtime data
+*.sqlite3
+settings.json
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Generated iconset (keep source PNG + final icns)
+assets/AppIcon.iconset/

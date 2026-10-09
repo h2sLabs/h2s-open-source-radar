@@ -74,7 +74,7 @@ pip install -r requirements-dev.txt
 pyinstaller --noconfirm "H2S Open Source Radar.spec"
 ```
 
-The build configuration currently targets Apple Silicon (`arm64`).
+For the dependency set reviewed for v0.1.0, use `requirements-lock.txt`. The build configuration currently targets Apple Silicon (`arm64`).
 
 ## How ranking works
 
