@@ -121,7 +121,6 @@ def parse_dt(s):
  except Exception:return datetime(2000,1,1,tzinfo=timezone.utc)
 
 def score_repo(item,settings,ctx):
- lang=normalize_language(settings.get("language","en"))
  desc=item.get("description") or ""
  topics=" ".join(item.get("topics") or [])
  text=f"{item.get('name','')} {desc} {topics}".lower()
@@ -144,12 +143,14 @@ def score_repo(item,settings,ctx):
  context_score=min(24,len(ctx_hits)*4)
 
  score=min(100,star_score+recency+fresh+interest_score+context_score)
+ lang=normalize_language(settings.get("language","en"))
  why=[]
  if context_score>=12: why.append(tr(lang,"reason_context_strong"))
- elif context_score>0: why.append(tr(lang,"reason_context"))
+ elif context_score>0: why.append(tr(lang,"reason_context_recent"))
  if interest_score>=12: why.append(tr(lang,"reason_interest"))
- if stars>=1000: why.append(tr(lang,"reason_popular",stars=stars))
- if pdays<=30: why.append(tr(lang,"reason_recent"))
+ if stars>=10000: why.append(tr(lang,"reason_popular",stars=stars))
+ elif stars>=1000: why.append(tr(lang,"reason_stars",stars=stars))
+ if pdays<=30: why.append(tr(lang,"reason_active"))
  if cdays<=180: why.append(tr(lang,"reason_new"))
  return score,interest_score,context_score," · ".join(why[:4])
 

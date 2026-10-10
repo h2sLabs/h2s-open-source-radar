@@ -16,8 +16,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit, QMessageBox, QSystemTrayIcon, QMenu, QProgressBar, QComboBox,
     QFileDialog
 )
-from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter
-from PySide6.QtSvg import QSvgRenderer
+from PySide6.QtGui import QAction, QIcon, QPixmap
 
 from db import (
     init_db, load_settings, save_settings, query_repos, repo_by_id, mark_read,
@@ -56,26 +55,9 @@ def asset_path(name):
     return base / "assets" / name
 
 
-def brand_pixmap(size=256):
-    svg_path = asset_path("h2s-brand.svg")
-    pix = QPixmap(size, size)
-    pix.fill(Qt.transparent)
-    if svg_path.exists():
-        renderer = QSvgRenderer(str(svg_path))
-        if renderer.isValid():
-            painter = QPainter(pix)
-            renderer.render(painter)
-            painter.end()
-            return pix
-    ppm_path = asset_path("h2s-brand.ppm")
-    if ppm_path.exists():
-        fallback = QPixmap(str(ppm_path))
-        if not fallback.isNull():
-            return fallback.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-    return pix
-
 def app_icon():
-    return QIcon(brand_pixmap(256))
+    path = asset_path("h2s-app-icon.png")
+    return QIcon(str(path)) if path.exists() else QIcon()
 
 
 def sync_login_item(enabled):
@@ -364,7 +346,7 @@ class MainWindow(QMainWindow):
         brand_row = QHBoxLayout()
         logo = QLabel()
         logo.setObjectName("logo")
-        pix = brand_pixmap(64)
+        pix = QPixmap(str(asset_path("h2s-radar-mark.png")))
         if not pix.isNull():
             logo.setPixmap(pix.scaled(38, 38, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
