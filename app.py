@@ -1084,8 +1084,12 @@ class MainWindow(QMainWindow):
         self.probe_worker.start()
 
     def _continue_pending_probe(self):
-        if self.pending_probe and self.current_id() == self.pending_probe[0]:
+        if not self.pending_probe:
+            return
+        if self.current_id() == self.pending_probe[0]:
             self.probe_debounce.start(80)
+        else:
+            self.pending_probe = None
 
     def release_probe_done(self, repo_id, info):
         reason = (info.get("reason") or "").lower()
