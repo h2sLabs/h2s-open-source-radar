@@ -32,3 +32,10 @@ authentication and is not written to the app database by this project.
 When you select a project, Radar may query that project's public GitHub Releases API to locate a compatible macOS asset. Downloaded installer files are fetched directly from approved GitHub release hosts. H2S-managed install paths, versions, and installed sizes are stored only in the local Radar database.
 
 No local application binaries, plug-ins, project files, or document contents are uploaded for compatibility checks.
+
+
+## Korean project-description translation
+
+When the interface language is Korean, Radar may send the **public GitHub repository description only** to Google's public translation endpoint so the description can be shown in Korean. H2S applies a local AI/music terminology glossary before and after translation, and stores the translated result in the local Radar database for reuse.
+
+No local file contents, application activity, project filenames, clipboard data, keyboard input, hardware identifiers, or other personal context are included in translation requests. If translation is unavailable, Radar falls back to the original public GitHub description.
