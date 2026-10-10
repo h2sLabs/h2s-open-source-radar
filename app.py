@@ -20,7 +20,8 @@ from PySide6.QtGui import QAction, QIcon, QPixmap
 
 from db import (
     init_db, load_settings, save_settings, query_repos, repo_by_id, mark_read,
-    set_favorite, set_hidden, stats, update_release_info, set_managed_install
+    set_favorite, set_hidden, stats, update_release_info, set_managed_install,
+    update_description_translation
 )
 from engine import (
     DiscoveryEngine, sample_activity, scan_recent_project_signals, rescore_cached
@@ -30,6 +31,7 @@ from installer import (
     mac_profile, assess_repo, format_bytes, probe_release, install_release,
     license_group
 )
+from translator import translate_description, TRANSLATION_SOURCE
 
 APP_NAME = "H2S Open Source Radar"
 APP_VERSION = "0.1.0"
@@ -134,6 +136,28 @@ class ReleaseProbeWorker(QThread):
         try:
             info = probe_release(self.repo_data, self.profile)
             self.done.emit(self.repo_id, info)
+        except Exception as exc:
+            self.failed.emit(self.repo_id, str(exc))
+
+
+class TranslationWorker(QThread):
+    done = Signal(int, str, str, str)
+    failed = Signal(int, str)
+
+    def __init__(self, repo_id, original, category, parent=None):
+        super().__init__(parent)
+        self.repo_id = repo_id
+        self.original = original
+        self.category = category
+
+    def run(self):
+        try:
+            translated, source = translate_description(
+                self.original, self.category
+            )
+            self.done.emit(
+                self.repo_id, self.original, translated, source
+            )
         except Exception as exc:
             self.failed.emit(self.repo_id, str(exc))
 
@@ -291,6 +315,13 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.probe_worker = None
         self.install_worker = None
+        self.translation_worker = None
+        self.pending_translation = None
+        self.translation_cooldown = {}
+        self.translation_debounce = QTimer(self)
+        self.translation_debounce.setSingleShot(True)
+        self.translation_debounce.setInterval(120)
+        self.translation_debounce.timeout.connect(self._launch_pending_translation)
         self.row_ids = {}
         self.repo_cache = {}
         self.pending_probe = None
@@ -973,12 +1004,37 @@ class MainWindow(QMainWindow):
 
         topics = " · ".join((data.get("topics") or [])[:10])
         why = html.escape(data["why"] or self.t("interest_based"))
-        desc = html.escape(data["description"] or self.t("description_missing"))
+        original_desc = data["description"] or self.t("description_missing")
+        desc_text = original_desc
+        translation_note = ""
+
+        if self.lang == "ko" and data.get("description"):
+            cached_ko = (data.get("description_ko") or "").strip()
+            cached_original = data.get("description_ko_original") or ""
+            if (
+                cached_ko
+                and cached_original == data["description"]
+                and data.get("description_ko_source") == TRANSLATION_SOURCE
+            ):
+                desc_text = cached_ko
+                translation_note = self.t("translated_description")
+            else:
+                desc_text = self.t("translation_pending")
+                translation_note = self.t("translation_pending_note")
+                self.queue_description_translation(repo_id, data)
+
+        desc = html.escape(desc_text)
         topics_html = html.escape(topics)
         compat_reason = html.escape(assessment.get("reason") or "")
+        translation_html = (
+            f'<br><span style="color:#6F829F;font-size:10px">'
+            f'{html.escape(translation_note)}</span>'
+            if translation_note else ""
+        )
         self.detail.setHtml(
             f'<b style="color:#DCE6FF">{html.escape(self.t("why_it_fits"))}</b>  {why}'
             f'<br><span style="color:#BAC6D8">{desc}</span>'
+            f'{translation_html}'
             f'<br><span style="color:#78A7FF">{html.escape(self.t("mac_check"))}: '
             f'{compat_reason}</span>'
             f'<br><span style="color:#77849A">{topics_html}</span>'
@@ -1056,6 +1112,81 @@ class MainWindow(QMainWindow):
         self.install_btn.setText(self.t("install_checking"))
         self.install_btn.setToolTip(self.t("install_checking_tip"))
         self.queue_release_probe(repo_id, data)
+
+    def queue_description_translation(self, repo_id, data):
+        if self.lang != "ko":
+            return
+        original = (data.get("description") or "").strip()
+        if not original:
+            return
+        cooldown = float(self.translation_cooldown.get(repo_id, 0) or 0)
+        if cooldown > time.time():
+            return
+        self.pending_translation = (
+            repo_id,
+            original,
+            data.get("category") or "",
+        )
+        self.translation_debounce.start()
+
+    def _launch_pending_translation(self):
+        if not self.pending_translation:
+            return
+        repo_id, original, category = self.pending_translation
+        if self.current_id() != repo_id or self.lang != "ko":
+            self.pending_translation = None
+            return
+        if self.translation_worker and self.translation_worker.isRunning():
+            return
+
+        self.pending_translation = None
+        self.translation_worker = TranslationWorker(
+            repo_id, original, category, self
+        )
+        self.translation_worker.done.connect(self.translation_done)
+        self.translation_worker.failed.connect(self.translation_failed)
+        self.translation_worker.start()
+
+    def _continue_pending_translation(self):
+        if not self.pending_translation:
+            return
+        if (
+            self.current_id() == self.pending_translation[0]
+            and self.lang == "ko"
+        ):
+            self.translation_debounce.start(60)
+        else:
+            self.pending_translation = None
+
+    def translation_done(self, repo_id, original, translated, source):
+        update_description_translation(
+            repo_id, original, translated, source
+        )
+        fresh = repo_by_id(repo_id)
+        if fresh:
+            self.repo_cache[repo_id] = fresh
+        if self.current_id() == repo_id and self.lang == "ko":
+            self.show_selected()
+        QTimer.singleShot(0, self._continue_pending_translation)
+
+    def translation_failed(self, repo_id, message):
+        self.translation_cooldown[repo_id] = time.time() + 120
+        if self.current_id() == repo_id and self.lang == "ko":
+            data = self.repo_cache.get(repo_id) or repo_by_id(repo_id)
+            if data:
+                # Fall back to the original description instead of leaving a
+                # permanent loading message when translation is unavailable.
+                original = html.escape(
+                    data.get("description") or self.t("description_missing")
+                )
+                self.detail.setHtml(
+                    f'<b style="color:#DCE6FF">{html.escape(self.t("why_it_fits"))}</b>  '
+                    f'{html.escape(data.get("why") or self.t("interest_based"))}'
+                    f'<br><span style="color:#BAC6D8">{original}</span>'
+                    f'<br><span style="color:#A07A7A;font-size:10px">'
+                    f'{html.escape(self.t("translation_failed_short"))}</span>'
+                )
+        QTimer.singleShot(0, self._continue_pending_translation)
 
     def queue_release_probe(self, repo_id, data):
         cooldown = float(self.probe_cooldown.get(repo_id, 0) or 0)
