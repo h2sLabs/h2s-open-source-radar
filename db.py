@@ -53,6 +53,10 @@ def _ensure_columns(conn):
         "installed_version": "TEXT DEFAULT ''",
         "installed_at": "TEXT DEFAULT ''",
         "installed_size": "INTEGER DEFAULT 0",
+        "description_ko": "TEXT DEFAULT ''",
+        "description_ko_original": "TEXT DEFAULT ''",
+        "description_ko_source": "TEXT DEFAULT ''",
+        "description_ko_updated_at": "TEXT DEFAULT ''",
     }
     for name, definition in migrations.items():
         if name not in existing:
@@ -271,6 +275,31 @@ def update_release_info(repo_id, info):
             now_iso(),
             repo_id,
         ))
+
+
+def update_description_translation(repo_id, original, translated, source=""):
+    with connect() as conn:
+        _ensure_columns(conn)
+        conn.execute("""
+            UPDATE repos
+            SET description_ko=?, description_ko_original=?,
+                description_ko_source=?, description_ko_updated_at=?
+            WHERE id=?
+        """, (
+            str(translated or ""), str(original or ""), str(source or ""),
+            now_iso(), repo_id
+        ))
+
+
+def clear_description_translation(repo_id):
+    with connect() as conn:
+        _ensure_columns(conn)
+        conn.execute("""
+            UPDATE repos
+            SET description_ko='', description_ko_original='',
+                description_ko_source='', description_ko_updated_at=''
+            WHERE id=?
+        """, (repo_id,))
 
 
 def set_managed_install(repo_id, path, version="", size_bytes=0):
