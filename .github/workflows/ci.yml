@@ -23,7 +23,7 @@ jobs:
           pip check
       - name: Compile source
         run: |
-          python -m py_compile app.py db.py engine.py i18n.py installer.py
+          python -m py_compile app.py db.py engine.py i18n.py installer.py translator.py
       - name: Import and UI smoke test
         env:
           QT_QPA_PLATFORM: offscreen
