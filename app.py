@@ -292,6 +292,13 @@ class MainWindow(QMainWindow):
         self.probe_worker = None
         self.install_worker = None
         self.row_ids = {}
+        self.repo_cache = {}
+        self.pending_probe = None
+        self.probe_cooldown = {}
+        self.probe_debounce = QTimer(self)
+        self.probe_debounce.setSingleShot(True)
+        self.probe_debounce.setInterval(180)
+        self.probe_debounce.timeout.connect(self._launch_pending_probe)
         self.mode = "all"
         self.category = ""
         self.profile = mac_profile()
@@ -822,6 +829,7 @@ class MainWindow(QMainWindow):
         return True
 
     def load_items(self):
+        previous_id = self.current_id()
         raw_rows = query_repos(
             self.category, self.mode, self.search.text().strip(), limit=500
         )
@@ -832,59 +840,72 @@ class MainWindow(QMainWindow):
             if self._passes_advanced_filters(data, assessment):
                 rows.append((data, assessment))
 
-        self.table.setRowCount(len(rows))
-        self.row_ids = {}
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(rows))
+            self.row_ids = {}
+            self.repo_cache = {}
 
-        for row_index, (data, assessment) in enumerate(rows):
-            self.row_ids[row_index] = data["id"]
-            project = data["full_name"]
-            if data["is_new"]:
-                project = "✦ " + project
-            if data["favorite"]:
-                project = "★ " + project
+            for row_index, (data, assessment) in enumerate(rows):
+                repo_id = data["id"]
+                self.row_ids[row_index] = repo_id
+                self.repo_cache[repo_id] = data
+                project = data["full_name"]
+                if data["is_new"]:
+                    project = "✦ " + project
+                if data["favorite"]:
+                    project = "★ " + project
 
-            mac_text = self.compatibility_label(assessment)
-            installed_text = (
-                self.t("installed_yes_short")
-                if assessment.get("installed")
-                else self.t("installed_no_short")
-            )
-            if int(data.get("installed_size") or 0) > 0:
-                size_text = format_bytes(data.get("installed_size"))
-            else:
-                size_text = f'≈ {format_bytes(assessment.get("estimated_bytes"))}+'
+                mac_text = self.compatibility_label(assessment)
+                installed_text = (
+                    self.t("installed_yes_short")
+                    if assessment.get("installed")
+                    else self.t("installed_no_short")
+                )
+                if int(data.get("installed_size") or 0) > 0:
+                    size_text = format_bytes(data.get("installed_size"))
+                else:
+                    size_text = f'≈ {format_bytes(assessment.get("estimated_bytes"))}+'
 
-            vals = [
-                str(data["score"]),
-                project,
-                mac_text,
-                installed_text,
-                size_text,
-                category_name(self.lang, data["category"]),
-                f'{int(data["stars"] or 0):,}',
-                data["language"] or "—",
-                (data["pushed_at"] or "")[:10],
-                data["why"] or self.t("interest_based"),
-            ]
-            for col, value in enumerate(vals):
-                item = QTableWidgetItem(value)
-                item.setData(Qt.UserRole, data["id"])
-                if col in {0, 2, 3, 4}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                if col == 2:
-                    item.setToolTip(assessment.get("reason") or "")
-                if col == 3 and assessment.get("installed_path"):
-                    item.setToolTip(assessment.get("installed_path"))
-                if col == 4:
-                    item.setToolTip(self.t("size_estimate_tooltip"))
-                self.table.setItem(row_index, col, item)
+                vals = [
+                    str(data["score"]),
+                    project,
+                    mac_text,
+                    installed_text,
+                    size_text,
+                    category_name(self.lang, data["category"]),
+                    f'{int(data["stars"] or 0):,}',
+                    data["language"] or "—",
+                    (data["pushed_at"] or "")[:10],
+                    data["why"] or self.t("interest_based"),
+                ]
+                for col, value in enumerate(vals):
+                    item = QTableWidgetItem(value)
+                    item.setData(Qt.UserRole, repo_id)
+                    if col in {0, 2, 3, 4}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    if col == 2:
+                        item.setToolTip(assessment.get("reason") or "")
+                    if col == 3 and assessment.get("installed_path"):
+                        item.setToolTip(assessment.get("installed_path"))
+                    if col == 4:
+                        item.setToolTip(self.t("size_estimate_tooltip"))
+                    self.table.setItem(row_index, col, item)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
         current_stats = stats()
         for key, label in self.stats_labels.items():
             label.setText(str(current_stats.get(key, 0)))
 
         if rows:
-            self.table.selectRow(0)
+            selected = False
+            if previous_id:
+                selected = self.select_repo_id(previous_id)
+            if not selected:
+                self.table.selectRow(0)
         else:
             self.detail_meta.setText(self.t("no_results_meta"))
             self.detail_title.setText(self.t("no_results"))
@@ -927,11 +948,14 @@ class MainWindow(QMainWindow):
         repo_id = self.current_id()
         if not repo_id:
             return
-        data = repo_by_id(repo_id)
+        data = self.repo_cache.get(repo_id) or repo_by_id(repo_id)
         if not data:
             return
 
-        mark_read(repo_id)
+        if data.get("is_new"):
+            mark_read(repo_id)
+            data["is_new"] = 0
+            self.repo_cache[repo_id] = data
         assessment = assess_repo(data, self.profile)
         self.current_assessment = assessment
         self.current_release_info = None
@@ -1031,11 +1055,27 @@ class MainWindow(QMainWindow):
         self.install_btn.setEnabled(False)
         self.install_btn.setText(self.t("install_checking"))
         self.install_btn.setToolTip(self.t("install_checking_tip"))
-        self.start_release_probe(repo_id, data)
+        self.queue_release_probe(repo_id, data)
 
-    def start_release_probe(self, repo_id, data):
+    def queue_release_probe(self, repo_id, data):
+        cooldown = float(self.probe_cooldown.get(repo_id, 0) or 0)
+        if cooldown > time.time():
+            self.install_btn.setEnabled(False)
+            self.install_btn.setText(self.t("install_unavailable"))
+            return
+        self.pending_probe = (repo_id, dict(data))
+        self.probe_debounce.start()
+
+    def _launch_pending_probe(self):
+        if not self.pending_probe:
+            return
+        repo_id, data = self.pending_probe
+        if self.current_id() != repo_id:
+            self.pending_probe = None
+            return
         if self.probe_worker and self.probe_worker.isRunning():
             return
+        self.pending_probe = None
         self.probe_worker = ReleaseProbeWorker(
             repo_id, data, dict(self.profile), self
         )
@@ -1043,27 +1083,34 @@ class MainWindow(QMainWindow):
         self.probe_worker.failed.connect(self.release_probe_failed)
         self.probe_worker.start()
 
+    def _continue_pending_probe(self):
+        if self.pending_probe and self.current_id() == self.pending_probe[0]:
+            self.probe_debounce.start(80)
+
     def release_probe_done(self, repo_id, info):
         reason = (info.get("reason") or "").lower()
-        if "rate limit" not in reason:
-            update_release_info(repo_id, info)
-
-        current = self.current_id()
-        self.profile = mac_profile()
-        if current == repo_id:
-            self.load_items()
-            self.select_repo_id(repo_id)
-            self.show_selected()
+        if "rate limit" in reason:
+            self.probe_cooldown[repo_id] = time.time() + 300
         else:
-            QTimer.singleShot(80, self.show_selected)
+            update_release_info(repo_id, info)
+            fresh = repo_by_id(repo_id)
+            if fresh:
+                self.repo_cache[repo_id] = fresh
+
+        if self.current_id() == repo_id:
+            # Update only the detail pane. Rebuilding all 200+ table rows here
+            # caused the visible click lag.
+            self.show_selected()
+
+        QTimer.singleShot(0, self._continue_pending_probe)
 
     def release_probe_failed(self, repo_id, message):
+        self.probe_cooldown[repo_id] = time.time() + 180
         if self.current_id() == repo_id:
             self.install_btn.setEnabled(False)
             self.install_btn.setText(self.t("install_unavailable"))
             self.install_btn.setToolTip(message)
-        else:
-            QTimer.singleShot(80, self.show_selected)
+        QTimer.singleShot(0, self._continue_pending_probe)
 
     def select_repo_id(self, repo_id):
         for row, value in self.row_ids.items():
