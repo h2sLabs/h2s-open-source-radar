@@ -4,6 +4,7 @@ from pathlib import Path
 import requests
 from AppKit import NSWorkspace
 from db import add_activity, recent_activity, upsert_repo, load_settings, cleanup_activity, connect
+from i18n import tr, normalize_language
 
 API="https://api.github.com/search/repositories"
 UA="H2S-Open-Source-Radar/1.0"
@@ -120,6 +121,7 @@ def parse_dt(s):
  except Exception:return datetime(2000,1,1,tzinfo=timezone.utc)
 
 def score_repo(item,settings,ctx):
+ lang=normalize_language(settings.get("language","en"))
  desc=item.get("description") or ""
  topics=" ".join(item.get("topics") or [])
  text=f"{item.get('name','')} {desc} {topics}".lower()
@@ -143,13 +145,12 @@ def score_repo(item,settings,ctx):
 
  score=min(100,star_score+recency+fresh+interest_score+context_score)
  why=[]
- if context_score>=12: why.append("현재 작업과 강하게 연관")
- elif context_score>0: why.append("최근 작업 맥락과 연관")
- if interest_score>=12: why.append("관심분야 일치")
- if stars>=10000: why.append(f"인기 {stars:,}★")
- elif stars>=1000: why.append(f"{stars:,}★")
- if pdays<=30: why.append("최근 활발히 업데이트")
- if cdays<=180: why.append("신규 프로젝트")
+ if context_score>=12: why.append(tr(lang,"reason_context_strong"))
+ elif context_score>0: why.append(tr(lang,"reason_context"))
+ if interest_score>=12: why.append(tr(lang,"reason_interest"))
+ if stars>=1000: why.append(tr(lang,"reason_popular",stars=stars))
+ if pdays<=30: why.append(tr(lang,"reason_recent"))
+ if cdays<=180: why.append(tr(lang,"reason_new"))
  return score,interest_score,context_score," · ".join(why[:4])
 
 def search_queries(settings,ctx):
@@ -219,7 +220,7 @@ class DiscoveryEngine:
     "full_name":item["full_name"],"name":item["name"],"owner":item.get("owner",{}).get("login",""),
     "html_url":item["html_url"],"description":item.get("description") or "","category":category_for(blob),
     "language":item.get("language") or "","license":(item.get("license") or {}).get("spdx_id") or "",
-    "stars":item.get("stargazers_count",0),"forks":item.get("forks_count",0),"topics":item.get("topics") or [],
+    "stars":item.get("stargazers_count",0),"forks":item.get("forks_count",0),"repo_size_kb":item.get("size",0),"topics":item.get("topics") or [],
     "created_at":item.get("created_at",""),"updated_at":item.get("updated_at",""),"pushed_at":item.get("pushed_at",""),
     "score":score,"interest_score":interest_score,"context_score":context_score,"why":why}
    rid,created,changed=upsert_repo(repo)

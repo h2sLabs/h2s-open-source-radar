@@ -8,7 +8,10 @@ a = Analysis(
     ['app.py'],
     pathex=[str(project)],
     binaries=[],
-    datas=[(str(project / 'assets' / 'h2s-radar.png'), 'assets')],
+    datas=[
+        (str(project / 'assets' / 'h2s-brand.svg'), 'assets'),
+        (str(project / 'assets' / 'h2s-brand.ppm'), 'assets'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -50,7 +53,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='H2S Open Source Radar.app',
-    icon=str(project / 'assets' / 'H2SOpenSourceRadar.icns'),
+    icon=str(project / 'assets' / 'h2s-brand.ppm'),
     bundle_identifier='com.h2sstudio.opensource-radar',
     info_plist={
         'CFBundleDisplayName': 'H2S Open Source Radar',

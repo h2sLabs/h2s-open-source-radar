@@ -5,40 +5,49 @@ import plistlib
 import os
 import time
 import html
+from datetime import datetime, timezone
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QTableWidget, QTableWidgetItem, QAbstractItemView,
     QHeaderView, QTextBrowser, QDialog, QFormLayout, QSpinBox, QCheckBox,
-    QPlainTextEdit, QMessageBox, QSystemTrayIcon, QMenu, QProgressBar
+    QPlainTextEdit, QMessageBox, QSystemTrayIcon, QMenu, QProgressBar, QComboBox,
+    QFileDialog
 )
-from PySide6.QtGui import QAction, QIcon, QPixmap
+from PySide6.QtGui import QAction, QIcon, QPixmap, QPainter
+from PySide6.QtSvg import QSvgRenderer
 
 from db import (
     init_db, load_settings, save_settings, query_repos, repo_by_id, mark_read,
-    set_favorite, set_hidden, stats
+    set_favorite, set_hidden, stats, update_release_info, set_managed_install
 )
 from engine import (
     DiscoveryEngine, sample_activity, scan_recent_project_signals, rescore_cached
+)
+from i18n import tr, category_name, normalize_language
+from installer import (
+    mac_profile, assess_repo, format_bytes, probe_release, install_release,
+    license_group
 )
 
 APP_NAME = "H2S Open Source Radar"
 APP_VERSION = "0.1.0"
 WEBSITE = "https://h2sstudio.com"
+
 CATEGORIES = [
     "작곡·음악 생성", "DAW 자동화", "Audio→MIDI·채보", "Stem·오디오 분리",
     "보컬·가창 합성", "Agent·MCP", "로컬 LLM", "영상·이미지 AI",
-    "3D·비전", "기타 AI"
+    "3D·비전", "기타 AI",
 ]
 
-FILTER_TITLES = {
-    ("all", ""): ("For You", "인기·신선도·관심분야·현재 작업 맥락을 함께 반영한 추천입니다."),
-    ("hot", ""): ("Trending", "추천 점수와 최근 활동성이 높은 프로젝트를 모았습니다."),
-    ("context", ""): ("In Your Flow", "지금 Mac에서 실행 중인 작업과 연관성이 높은 프로젝트입니다."),
-    ("new", ""): ("New Discoveries", "아직 확인하지 않은 새 프로젝트입니다."),
-    ("favorite", ""): ("Saved", "나중에 다시 볼 프로젝트를 모아둡니다."),
+FILTER_KEYS = {
+    "all": ("for_you_title", "for_you_sub"),
+    "hot": ("trending_title", "trending_sub"),
+    "context": ("context_title", "context_sub"),
+    "new": ("new_title", "new_sub"),
+    "favorite": ("saved_title", "saved_sub"),
 }
 
 
@@ -47,9 +56,26 @@ def asset_path(name):
     return base / "assets" / name
 
 
+def brand_pixmap(size=256):
+    svg_path = asset_path("h2s-brand.svg")
+    pix = QPixmap(size, size)
+    pix.fill(Qt.transparent)
+    if svg_path.exists():
+        renderer = QSvgRenderer(str(svg_path))
+        if renderer.isValid():
+            painter = QPainter(pix)
+            renderer.render(painter)
+            painter.end()
+            return pix
+    ppm_path = asset_path("h2s-brand.ppm")
+    if ppm_path.exists():
+        fallback = QPixmap(str(ppm_path))
+        if not fallback.isNull():
+            return fallback.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    return pix
+
 def app_icon():
-    p = asset_path("h2s-radar.png")
-    return QIcon(str(p)) if p.exists() else QIcon()
+    return QIcon(brand_pixmap(256))
 
 
 def sync_login_item(enabled):
@@ -112,78 +138,132 @@ class ScanWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class ReleaseProbeWorker(QThread):
+    done = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, repo_id, repo_data, profile, parent=None):
+        super().__init__(parent)
+        self.repo_id = repo_id
+        self.repo_data = repo_data
+        self.profile = profile
+
+    def run(self):
+        try:
+            info = probe_release(self.repo_data, self.profile)
+            self.done.emit(self.repo_id, info)
+        except Exception as exc:
+            self.failed.emit(self.repo_id, str(exc))
+
+
+class InstallWorker(QThread):
+    progress = Signal(int)
+    done = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, repo_id, repo_data, release_info, parent=None):
+        super().__init__(parent)
+        self.repo_id = repo_id
+        self.repo_data = repo_data
+        self.release_info = release_info
+
+    def run(self):
+        try:
+            result = install_release(
+                self.repo_data,
+                self.release_info,
+                progress=lambda value: self.progress.emit(value),
+            )
+            self.done.emit(self.repo_id, result)
+        except Exception as exc:
+            self.failed.emit(self.repo_id, str(exc))
+
+
 class SettingsDialog(QDialog):
     saved = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.settings = load_settings()
-        self.setWindowTitle("Open Source Radar 설정")
-        self.resize(690, 650)
+        self.lang = normalize_language(self.settings.get("language", "en"))
+
+        self.setWindowTitle(tr(self.lang, "settings_title"))
+        self.resize(700, 690)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 26, 28, 26)
         root.setSpacing(14)
 
-        eyebrow = QLabel("PERSONAL RADAR")
+        eyebrow = QLabel(tr(self.lang, "personal_radar"))
         eyebrow.setObjectName("eyebrow")
         root.addWidget(eyebrow)
 
-        title = QLabel("관심분야와 자동 추천")
+        title = QLabel(tr(self.lang, "settings_heading"))
         title.setObjectName("dialogTitle")
         root.addWidget(title)
 
-        note = QLabel(
-            "한 줄에 하나씩 관심분야를 적어주세요. 입력값은 단순 필터가 아니라 "
-            "GitHub 검색 쿼리와 추천 점수에 실제로 반영됩니다."
-        )
+        note = QLabel(tr(self.lang, "settings_note"))
         note.setWordWrap(True)
         note.setObjectName("muted")
         root.addWidget(note)
 
         self.interests = QPlainTextEdit()
         self.interests.setPlainText("\n".join(self.settings.get("interests", [])))
-        self.interests.setPlaceholderText(
-            "예: Logic Pro automation\nAudio to MIDI\nSinging voice synthesis"
-        )
+        self.interests.setPlaceholderText(tr(self.lang, "interests_placeholder"))
         root.addWidget(self.interests, 1)
 
         form = QFormLayout()
         form.setSpacing(12)
 
+        self.language = QComboBox()
+        self.language.addItem("English", "en")
+        self.language.addItem("한국어", "ko")
+        idx = self.language.findData(self.lang)
+        if idx >= 0:
+            self.language.setCurrentIndex(idx)
+        form.addRow(tr(self.lang, "language"), self.language)
+
         self.hours = QSpinBox()
         self.hours.setRange(1, 24)
-        self.hours.setSuffix("시간")
+        self.hours.setSuffix(tr(self.lang, "hours_suffix"))
         self.hours.setValue(int(self.settings.get("auto_refresh_hours", 6)))
-        form.addRow("자동 탐색 주기", self.hours)
+        form.addRow(tr(self.lang, "refresh_interval"), self.hours)
 
         self.score = QSpinBox()
         self.score.setRange(50, 100)
         self.score.setValue(int(self.settings.get("notify_score", 82)))
-        form.addRow("알림 기준 점수", self.score)
+        form.addRow(tr(self.lang, "notification_score"), self.score)
 
-        self.monitor = QCheckBox("현재 작업 맥락을 사용해 추천 순위를 자동 조정")
+        self.monitor = QCheckBox(tr(self.lang, "context_monitor"))
         self.monitor.setChecked(bool(self.settings.get("context_monitoring", True)))
         form.addRow("", self.monitor)
 
-        self.login = QCheckBox("Mac 로그인 시 백그라운드 자동 실행")
+        self.login = QCheckBox(tr(self.lang, "start_login"))
         self.login.setChecked(bool(self.settings.get("start_at_login", True)))
         form.addRow("", self.login)
 
+        install_row = QHBoxLayout()
+        self.install_root = QLineEdit(
+            os.path.expanduser(self.settings.get("install_root") or "~/Applications/H2S Tools")
+        )
+        browse = QPushButton(tr(self.lang, "browse"))
+        browse.clicked.connect(self.choose_install_root)
+        install_row.addWidget(self.install_root, 1)
+        install_row.addWidget(browse)
+        form.addRow(tr(self.lang, "install_location"), install_row)
+
         root.addLayout(form)
 
-        privacy = QLabel(
-            "Privacy by default  ·  앱 이름과 최근 프로젝트 파일의 이름·확장자만 로컬에서 사용합니다. "
-            "키 입력, 화면 캡처, 클립보드, 파일 본문은 수집하지 않습니다."
-        )
+        privacy = QLabel(tr(self.lang, "privacy_settings"))
         privacy.setWordWrap(True)
         privacy.setObjectName("privacy")
         root.addWidget(privacy)
 
         row = QHBoxLayout()
         row.addStretch()
-        cancel = QPushButton("취소")
-        save = QPushButton("저장")
+
+        cancel = QPushButton(tr(self.lang, "cancel"))
+        save = QPushButton(tr(self.lang, "save"))
         save.setObjectName("primary")
         row.addWidget(cancel)
         row.addWidget(save)
@@ -192,15 +272,28 @@ class SettingsDialog(QDialog):
         cancel.clicked.connect(self.reject)
         save.clicked.connect(self.do_save)
 
+    def choose_install_root(self):
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            tr(self.lang, "choose_install_location"),
+            self.install_root.text().strip() or str(Path.home() / "Applications"),
+        )
+        if selected:
+            self.install_root.setText(selected)
+
     def do_save(self):
         vals = [x.strip() for x in self.interests.toPlainText().splitlines() if x.strip()]
         data = dict(self.settings)
         data.update({
             "interests": vals,
+            "language": self.language.currentData(),
             "auto_refresh_hours": self.hours.value(),
             "notify_score": self.score.value(),
             "context_monitoring": self.monitor.isChecked(),
             "start_at_login": self.login.isChecked(),
+            "install_root": os.path.expanduser(
+                self.install_root.text().strip() or "~/Applications/H2S Tools"
+            ),
         })
         save_settings(data)
         self.saved.emit(data)
@@ -212,10 +305,19 @@ class MainWindow(QMainWindow):
         super().__init__()
         init_db()
         self.settings = load_settings()
+        self.lang = normalize_language(self.settings.get("language", "en"))
         self.worker = None
+        self.probe_worker = None
+        self.install_worker = None
         self.row_ids = {}
         self.mode = "all"
         self.category = ""
+        self.profile = mac_profile()
+        self.current_release_info = None
+        self.current_assessment = None
+
+        # Re-score cached rows so recommendation reasons always match the selected UI language.
+        rescore_cached()
 
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(app_icon())
@@ -231,10 +333,17 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(700, self.sample_context)
         QTimer.singleShot(1400, self.auto_refresh_if_due)
 
+    def t(self, key, **kwargs):
+        return tr(self.lang, key, **kwargs)
+
     def section_label(self, text):
         label = QLabel(text)
         label.setObjectName("sectionLabel")
         return label
+
+    def filter_title_subtitle(self, mode):
+        title_key, sub_key = FILTER_KEYS.get(mode, FILTER_KEYS["all"])
+        return self.t(title_key), self.t(sub_key)
 
     def build_ui(self):
         central = QWidget()
@@ -255,7 +364,7 @@ class MainWindow(QMainWindow):
         brand_row = QHBoxLayout()
         logo = QLabel()
         logo.setObjectName("logo")
-        pix = QPixmap(str(asset_path("h2s-radar.png")))
+        pix = brand_pixmap(64)
         if not pix.isNull():
             logo.setPixmap(pix.scaled(38, 38, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
@@ -273,42 +382,30 @@ class MainWindow(QMainWindow):
         brand_row.addStretch()
         sl.addLayout(brand_row)
 
-        sub = QLabel("Find what matters before you search.")
+        sub = QLabel(self.t("brand_tagline"))
         sub.setObjectName("muted")
         sub.setWordWrap(True)
         sl.addWidget(sub)
         sl.addSpacing(14)
 
-        sl.addWidget(self.section_label("DISCOVER"))
+        sl.addWidget(self.section_label(self.t("discover")))
 
         self.nav = []
         specs = [
-            ("⌂  For You", "all", ""),
-            ("↗  Trending", "hot", ""),
-            ("◎  In Your Flow", "context", ""),
-            ("✦  New Discoveries", "new", ""),
-            ("★  Saved", "favorite", ""),
+            (self.t("nav_for_you"), "all", ""),
+            (self.t("nav_trending"), "hot", ""),
+            (self.t("nav_context"), "context", ""),
+            (self.t("nav_new"), "new", ""),
+            (self.t("nav_saved"), "favorite", ""),
         ]
         for label, mode, cat in specs:
             self.add_nav(sl, label, mode, cat)
 
         sl.addSpacing(12)
-        sl.addWidget(self.section_label("CATEGORIES"))
+        sl.addWidget(self.section_label(self.t("categories")))
 
-        category_labels = {
-            "작곡·음악 생성": "Music Generation",
-            "DAW 자동화": "DAW Automation",
-            "Audio→MIDI·채보": "Audio → MIDI",
-            "Stem·오디오 분리": "Stem Separation",
-            "보컬·가창 합성": "Vocal Synthesis",
-            "Agent·MCP": "Agents · MCP",
-            "로컬 LLM": "Local LLM",
-            "영상·이미지 AI": "Video · Image",
-            "3D·비전": "3D · Vision",
-            "기타 AI": "Other AI",
-        }
         for cat in CATEGORIES:
-            self.add_nav(sl, category_labels.get(cat, cat), "all", cat)
+            self.add_nav(sl, category_name(self.lang, cat), "all", cat)
 
         self.nav[0].setChecked(True)
         sl.addStretch()
@@ -322,19 +419,19 @@ class MainWindow(QMainWindow):
         context_head = QHBoxLayout()
         dot = QLabel("●")
         dot.setObjectName("liveDot")
-        cap = QLabel("LIVE CONTEXT")
+        cap = QLabel(self.t("live_context"))
         cap.setObjectName("sectionLabel")
         context_head.addWidget(dot)
         context_head.addWidget(cap)
         context_head.addStretch()
         cc.addLayout(context_head)
 
-        self.context_side = QLabel("작업 맥락을 확인하는 중…")
+        self.context_side = QLabel(self.t("context_loading"))
         self.context_side.setObjectName("contextText")
         self.context_side.setWordWrap(True)
         cc.addWidget(self.context_side)
 
-        privacy = QLabel("Local only · no screen / keys")
+        privacy = QLabel(self.t("privacy_mini"))
         privacy.setObjectName("privacyMini")
         cc.addWidget(privacy)
         sl.addWidget(context_card)
@@ -344,7 +441,7 @@ class MainWindow(QMainWindow):
         website.clicked.connect(lambda: webbrowser.open(WEBSITE))
         sl.addWidget(website)
 
-        settings = QPushButton("⚙  Settings")
+        settings = QPushButton(self.t("settings"))
         settings.setObjectName("nav")
         settings.clicked.connect(self.open_settings)
         sl.addWidget(settings)
@@ -360,39 +457,43 @@ class MainWindow(QMainWindow):
 
         hero = QHBoxLayout()
         head = QVBoxLayout()
-        eyebrow = QLabel("H2S PERSONAL OPEN-SOURCE INTELLIGENCE")
+
+        eyebrow = QLabel(self.t("hero_eyebrow"))
         eyebrow.setObjectName("eyebrow")
         head.addWidget(eyebrow)
 
-        self.page_title = QLabel("For You")
+        first_title, first_sub = self.filter_title_subtitle("all")
+        self.page_title = QLabel(first_title)
         self.page_title.setObjectName("pageTitle")
         head.addWidget(self.page_title)
 
-        self.page_subtitle = QLabel(FILTER_TITLES[("all", "")][1])
+        self.page_subtitle = QLabel(first_sub)
         self.page_subtitle.setObjectName("muted")
         head.addWidget(self.page_subtitle)
         hero.addLayout(head, 1)
 
         actions = QVBoxLayout()
         actions.setSpacing(8)
+
         top_actions = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Search projects, tech, topics…")
+        self.search.setPlaceholderText(self.t("search_placeholder"))
         self.search.setMinimumWidth(360)
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.load_items)
         top_actions.addWidget(self.search)
 
-        self.refresh_btn = QPushButton("Refresh radar")
+        self.refresh_btn = QPushButton(self.t("refresh"))
         self.refresh_btn.setObjectName("primary")
         self.refresh_btn.clicked.connect(lambda: self.refresh(False))
         top_actions.addWidget(self.refresh_btn)
         actions.addLayout(top_actions)
 
-        self.status = QLabel("Cached recommendations are ready.")
+        self.status = QLabel(self.t("status_ready"))
         self.status.setObjectName("status")
         self.status.setAlignment(Qt.AlignRight)
         actions.addWidget(self.status)
+
         hero.addLayout(actions)
         main.addLayout(hero)
 
@@ -400,12 +501,13 @@ class MainWindow(QMainWindow):
         cards = QHBoxLayout()
         cards.setSpacing(10)
         self.stats_labels = {}
-        for key, label, hint in [
-            ("new_count", "New", "unread"),
-            ("hot_count", "Hot", "score 78+"),
-            ("context_count", "Context", "in your flow"),
-            ("favorite_count", "Saved", "bookmarked"),
-        ]:
+        stat_specs = [
+            ("new_count", "new_stat", "new_hint"),
+            ("hot_count", "hot_stat", "hot_hint"),
+            ("context_count", "context_stat", "context_hint"),
+            ("favorite_count", "saved_stat", "saved_hint"),
+        ]
+        for key, label_key, hint_key in stat_specs:
             card = QFrame()
             card.setObjectName("statCard")
             lay = QVBoxLayout(card)
@@ -413,7 +515,7 @@ class MainWindow(QMainWindow):
             lay.setSpacing(1)
 
             top = QHBoxLayout()
-            cap = QLabel(label)
+            cap = QLabel(self.t(label_key))
             cap.setObjectName("statLabel")
             num = QLabel("0")
             num.setObjectName("stat")
@@ -422,7 +524,7 @@ class MainWindow(QMainWindow):
             top.addWidget(num)
             lay.addLayout(top)
 
-            small = QLabel(hint)
+            small = QLabel(self.t(hint_key))
             small.setObjectName("tiny")
             lay.addWidget(small)
 
@@ -431,6 +533,118 @@ class MainWindow(QMainWindow):
 
         main.addLayout(cards)
 
+        # Advanced filters
+        filter_head = QHBoxLayout()
+        self.advanced_toggle = QPushButton(self.t("advanced_filters"))
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setObjectName("filterToggle")
+        filter_head.addWidget(self.advanced_toggle)
+        filter_head.addStretch()
+
+        machine = self.profile
+        self.machine_summary = QLabel(
+            f'{machine.get("cpu") or "Mac"} · {machine.get("arch")} · '
+            f'macOS {machine.get("macos")} · '
+            f'{format_bytes(machine.get("ram_bytes"))} RAM · '
+            f'{format_bytes(machine.get("free_bytes"))} free'
+        )
+        self.machine_summary.setObjectName("tiny")
+        filter_head.addWidget(self.machine_summary)
+        main.addLayout(filter_head)
+
+        self.advanced_panel = QFrame()
+        self.advanced_panel.setObjectName("filterPanel")
+        fp = QHBoxLayout(self.advanced_panel)
+        fp.setContentsMargins(12, 10, 12, 10)
+        fp.setSpacing(9)
+
+        def add_filter(label_text, items):
+            box = QVBoxLayout()
+            cap = QLabel(label_text)
+            cap.setObjectName("tiny")
+            combo = QComboBox()
+            for text_value, data_value in items:
+                combo.addItem(text_value, data_value)
+            box.addWidget(cap)
+            box.addWidget(combo)
+            fp.addLayout(box)
+            return combo
+
+        self.compat_filter = add_filter(
+            self.t("filter_compatibility"),
+            [
+                (self.t("filter_all"), "all"),
+                (self.t("filter_mac_ready"), "ready"),
+                (self.t("filter_one_click"), "oneclick"),
+                (self.t("filter_review"), "review"),
+                (self.t("filter_incompatible"), "blocked"),
+            ],
+        )
+        self.installed_filter = add_filter(
+            self.t("filter_installed"),
+            [
+                (self.t("filter_all"), "all"),
+                (self.t("filter_installed_yes"), "installed"),
+                (self.t("filter_installed_no"), "not_installed"),
+            ],
+        )
+        self.size_filter = add_filter(
+            self.t("filter_size"),
+            [
+                (self.t("filter_all"), "all"),
+                ("< 500 MB", "lt500"),
+                ("< 2 GB", "lt2g"),
+                ("< 5 GB", "lt5g"),
+                ("≥ 5 GB", "gte5g"),
+            ],
+        )
+        self.license_filter = add_filter(
+            self.t("filter_license"),
+            [
+                (self.t("filter_all"), "all"),
+                (self.t("filter_permissive"), "permissive"),
+                (self.t("filter_copyleft"), "copyleft"),
+                (self.t("filter_declared"), "declared"),
+                (self.t("filter_undeclared"), "undeclared"),
+            ],
+        )
+        self.updated_filter = add_filter(
+            self.t("filter_updated"),
+            [
+                (self.t("filter_all"), "all"),
+                (self.t("filter_30_days"), "30"),
+                (self.t("filter_90_days"), "90"),
+                (self.t("filter_1_year"), "365"),
+            ],
+        )
+
+        stars_box = QVBoxLayout()
+        stars_cap = QLabel(self.t("filter_min_stars"))
+        stars_cap.setObjectName("tiny")
+        self.min_stars_filter = QSpinBox()
+        self.min_stars_filter.setRange(0, 10000000)
+        self.min_stars_filter.setSingleStep(100)
+        self.min_stars_filter.setSpecialValueText(self.t("filter_any"))
+        stars_box.addWidget(stars_cap)
+        stars_box.addWidget(self.min_stars_filter)
+        fp.addLayout(stars_box)
+
+        reset_filters = QPushButton(self.t("filter_reset"))
+        reset_filters.clicked.connect(self.reset_advanced_filters)
+        fp.addWidget(reset_filters)
+        fp.addStretch()
+
+        for combo in [
+            self.compat_filter, self.installed_filter, self.size_filter,
+            self.license_filter, self.updated_filter,
+        ]:
+            combo.currentIndexChanged.connect(self.load_items)
+        self.min_stars_filter.valueChanged.connect(self.load_items)
+
+        self.advanced_panel.hide()
+        self.advanced_toggle.toggled.connect(self.advanced_panel.setVisible)
+        main.addWidget(self.advanced_panel)
+
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(3)
@@ -438,9 +652,11 @@ class MainWindow(QMainWindow):
         main.addWidget(self.progress)
 
         # Table
-        self.table = QTableWidget(0, 7)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
-            "SCORE", "CATEGORY", "PROJECT", "★ STARS", "LANG", "UPDATED", "WHY IT FITS"
+            self.t("score"), self.t("project"), self.t("mac_status"),
+            self.t("installed_col"), self.t("install_size"), self.t("category"),
+            self.t("stars"), self.t("language_col"), self.t("updated"), self.t("why")
         ])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(38)
@@ -452,10 +668,10 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
 
         hh = self.table.horizontalHeader()
-        for i in [0, 1, 3, 4, 5]:
+        for i in [0, 2, 3, 4, 5, 6, 7, 8]:
             hh.setSectionResizeMode(i, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        hh.setSectionResizeMode(6, QHeaderView.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setSectionResizeMode(9, QHeaderView.Stretch)
 
         self.table.itemSelectionChanged.connect(self.show_selected)
         self.table.itemDoubleClicked.connect(self.open_selected)
@@ -469,41 +685,59 @@ class MainWindow(QMainWindow):
         dl.setSpacing(7)
 
         meta_row = QHBoxLayout()
-        self.detail_meta = QLabel("Select a project")
+        self.detail_meta = QLabel(self.t("select_project"))
         self.detail_meta.setObjectName("tiny")
         meta_row.addWidget(self.detail_meta)
         meta_row.addStretch()
+
+        self.mac_badge = QLabel("—")
+        self.mac_badge.setObjectName("macBadge")
+        meta_row.addWidget(self.mac_badge)
 
         self.score_badge = QLabel("—")
         self.score_badge.setObjectName("scoreBadge")
         meta_row.addWidget(self.score_badge)
         dl.addLayout(meta_row)
 
-        self.detail_title = QLabel("추천 프로젝트를 선택하세요")
+        self.detail_title = QLabel(self.t("select_recommendation"))
         self.detail_title.setObjectName("detailTitle")
         self.detail_title.setWordWrap(True)
         dl.addWidget(self.detail_title)
 
         self.detail = QTextBrowser()
-        self.detail.setMaximumHeight(100)
+        self.detail.setMaximumHeight(112)
         self.detail.setOpenExternalLinks(True)
         dl.addWidget(self.detail)
 
+        self.install_info = QLabel(self.t("install_info_waiting"))
+        self.install_info.setObjectName("installInfo")
+        self.install_info.setWordWrap(True)
+        dl.addWidget(self.install_info)
+
         ar = QHBoxLayout()
-        self.open_btn = QPushButton("Open on GitHub  ↗")
+        self.install_btn = QPushButton(self.t("install_checking"))
+        self.install_btn.setObjectName("installPrimary")
+        self.install_btn.setEnabled(False)
+        self.guide_btn = QPushButton(self.t("quick_start_button"))
+        self.guide_btn.hide()
+        self.open_btn = QPushButton(self.t("open_github"))
         self.open_btn.setObjectName("primary")
-        self.save_btn = QPushButton("☆ Save")
-        self.hide_btn = QPushButton("Hide")
+        self.save_btn = QPushButton(self.t("save_button"))
+        self.hide_btn = QPushButton(self.t("hide"))
+        ar.addWidget(self.install_btn)
+        ar.addWidget(self.guide_btn)
         ar.addWidget(self.open_btn)
         ar.addWidget(self.save_btn)
         ar.addWidget(self.hide_btn)
         ar.addStretch()
 
-        footer = QLabel(f"v{APP_VERSION}  ·  H2S Labs  ·  Privacy-first")
+        footer = QLabel(f"v{APP_VERSION}  ·  H2S Labs  ·  {self.t('footer_privacy')}")
         footer.setObjectName("tiny")
         ar.addWidget(footer)
         dl.addLayout(ar)
 
+        self.install_btn.clicked.connect(self.install_or_open)
+        self.guide_btn.clicked.connect(self.show_quick_start)
         self.open_btn.clicked.connect(self.open_selected)
         self.save_btn.clicked.connect(self.toggle_save)
         self.hide_btn.clicked.connect(self.hide_selected)
@@ -528,102 +762,448 @@ class MainWindow(QMainWindow):
             b.setChecked(b is button)
 
         if cat:
-            self.page_title.setText(cat)
-            self.page_subtitle.setText("선택한 분야의 프로젝트를 추천 점수 순으로 보여줍니다.")
+            self.page_title.setText(category_name(self.lang, cat))
+            self.page_subtitle.setText(self.t("category_sub"))
         else:
-            title, sub = FILTER_TITLES.get((mode, ""), FILTER_TITLES[("all", "")])
+            title, sub = self.filter_title_subtitle(mode)
             self.page_title.setText(title)
             self.page_subtitle.setText(sub)
         self.load_items()
 
+    def reset_advanced_filters(self):
+        for combo in [
+            self.compat_filter, self.installed_filter, self.size_filter,
+            self.license_filter, self.updated_filter,
+        ]:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.min_stars_filter.blockSignals(True)
+        self.min_stars_filter.setValue(0)
+        self.min_stars_filter.blockSignals(False)
+        self.load_items()
+
+    def compatibility_label(self, assessment):
+        status = assessment.get("status")
+        if status == "ready":
+            return self.t("mac_ready_short")
+        if status == "blocked":
+            return self.t("mac_blocked_short")
+        return self.t("mac_review_short")
+
+    def _passes_advanced_filters(self, data, assessment):
+        compat = self.compat_filter.currentData()
+        if compat == "oneclick" and not assessment.get("one_click_ready"):
+            return False
+        if compat not in {"all", "oneclick"} and assessment.get("status") != compat:
+            return False
+
+        installed = self.installed_filter.currentData()
+        if installed == "installed" and not assessment.get("installed"):
+            return False
+        if installed == "not_installed" and assessment.get("installed"):
+            return False
+
+        estimate = int(assessment.get("estimated_bytes") or 0)
+        size_mode = self.size_filter.currentData()
+        if size_mode == "lt500" and estimate >= 500 * 1024**2:
+            return False
+        if size_mode == "lt2g" and estimate >= 2 * 1024**3:
+            return False
+        if size_mode == "lt5g" and estimate >= 5 * 1024**3:
+            return False
+        if size_mode == "gte5g" and estimate < 5 * 1024**3:
+            return False
+
+        group = assessment.get("license_group")
+        license_mode = self.license_filter.currentData()
+        if license_mode == "declared" and group == "undeclared":
+            return False
+        if license_mode in {"permissive", "copyleft", "undeclared"} and group != license_mode:
+            return False
+
+        if int(data.get("stars") or 0) < int(self.min_stars_filter.value()):
+            return False
+
+        updated_mode = self.updated_filter.currentData()
+        if updated_mode != "all":
+            try:
+                pushed = datetime.fromisoformat(
+                    (data.get("pushed_at") or "").replace("Z", "+00:00")
+                )
+                age = (datetime.now(timezone.utc) - pushed).days
+                if age > int(updated_mode):
+                    return False
+            except Exception:
+                return False
+
+        return True
+
     def load_items(self):
-        rows = query_repos(
+        raw_rows = query_repos(
             self.category, self.mode, self.search.text().strip(), limit=500
         )
+
+        rows = []
+        for data in raw_rows:
+            assessment = assess_repo(data, self.profile)
+            if self._passes_advanced_filters(data, assessment):
+                rows.append((data, assessment))
+
         self.table.setRowCount(len(rows))
         self.row_ids = {}
 
-        for r, d in enumerate(rows):
-            self.row_ids[r] = d["id"]
-            project = d["full_name"]
-            if d["is_new"]:
+        for row_index, (data, assessment) in enumerate(rows):
+            self.row_ids[row_index] = data["id"]
+            project = data["full_name"]
+            if data["is_new"]:
                 project = "✦ " + project
-            if d["favorite"]:
+            if data["favorite"]:
                 project = "★ " + project
 
+            mac_text = self.compatibility_label(assessment)
+            installed_text = (
+                self.t("installed_yes_short")
+                if assessment.get("installed")
+                else self.t("installed_no_short")
+            )
+            if int(data.get("installed_size") or 0) > 0:
+                size_text = format_bytes(data.get("installed_size"))
+            else:
+                size_text = f'≈ {format_bytes(assessment.get("estimated_bytes"))}+'
+
             vals = [
-                str(d["score"]),
-                d["category"],
+                str(data["score"]),
                 project,
-                f'{int(d["stars"] or 0):,}',
-                d["language"] or "—",
-                (d["pushed_at"] or "")[:10],
-                d["why"] or "관심분야 기반",
+                mac_text,
+                installed_text,
+                size_text,
+                category_name(self.lang, data["category"]),
+                f'{int(data["stars"] or 0):,}',
+                data["language"] or "—",
+                (data["pushed_at"] or "")[:10],
+                data["why"] or self.t("interest_based"),
             ]
             for col, value in enumerate(vals):
                 item = QTableWidgetItem(value)
-                item.setData(Qt.UserRole, d["id"])
-                if col == 0:
+                item.setData(Qt.UserRole, data["id"])
+                if col in {0, 2, 3, 4}:
                     item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(r, col, item)
+                if col == 2:
+                    item.setToolTip(assessment.get("reason") or "")
+                if col == 3 and assessment.get("installed_path"):
+                    item.setToolTip(assessment.get("installed_path"))
+                if col == 4:
+                    item.setToolTip(self.t("size_estimate_tooltip"))
+                self.table.setItem(row_index, col, item)
 
-        s = stats()
+        current_stats = stats()
         for key, label in self.stats_labels.items():
-            label.setText(str(s.get(key, 0)))
+            label.setText(str(current_stats.get(key, 0)))
 
-        if rows and self.table.currentRow() < 0:
+        if rows:
             self.table.selectRow(0)
-        if not rows:
-            self.detail_meta.setText("No results")
-            self.detail_title.setText("조건에 맞는 프로젝트가 없습니다")
+        else:
+            self.detail_meta.setText(self.t("no_results_meta"))
+            self.detail_title.setText(self.t("no_results"))
             self.score_badge.setText("—")
+            self.mac_badge.setText("—")
+            self.install_info.setText(self.t("install_info_waiting"))
+            self.install_btn.setEnabled(False)
+            self.install_btn.setText(self.t("install_unavailable"))
+            self.guide_btn.hide()
             self.detail.clear()
 
     def current_id(self):
         return self.row_ids.get(self.table.currentRow())
 
+    def _cached_release_info(self, data):
+        if not data.get("release_checked_at"):
+            return None
+        return {
+            "compatible": bool(data.get("release_compatible")),
+            "release_name": data.get("release_name") or "",
+            "tag_name": data.get("release_name") or "",
+            "asset_name": data.get("release_asset_name") or "",
+            "asset_url": data.get("release_asset_url") or "",
+            "asset_size": int(data.get("release_asset_size") or 0),
+            "install_method": data.get("release_install_method") or "",
+            "reason": data.get("release_reason") or "",
+        }
+
+    def _release_check_is_fresh(self, data, hours=12):
+        value = data.get("release_checked_at") or ""
+        if not value:
+            return False
+        try:
+            checked = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - checked).total_seconds() < hours * 3600
+        except Exception:
+            return False
+
     def show_selected(self):
         repo_id = self.current_id()
         if not repo_id:
             return
-        d = repo_by_id(repo_id)
-        if not d:
+        data = repo_by_id(repo_id)
+        if not data:
             return
 
         mark_read(repo_id)
+        assessment = assess_repo(data, self.profile)
+        self.current_assessment = assessment
+        self.current_release_info = None
+        self.guide_btn.setVisible(bool(assessment.get("installed")))
 
-        license_text = d["license"] or "license not declared"
+        license_text = data["license"] or self.t("license_missing")
+        language_text = data["language"] or self.t("language_missing")
         self.detail_meta.setText(
-            f'{d["category"]}  ·  {d["language"] or "language n/a"}  ·  '
-            f'{license_text}  ·  ★ {int(d["stars"] or 0):,}'
+            f'{category_name(self.lang, data["category"])}  ·  {language_text}  ·  '
+            f'{license_text}  ·  ★ {int(data["stars"] or 0):,}'
         )
-        self.score_badge.setText(f'{d["score"]}/100')
-        self.detail_title.setText(d["full_name"])
+        self.score_badge.setText(f'{data["score"]}/100')
+        self.mac_badge.setText(self.compatibility_label(assessment))
+        self.detail_title.setText(data["full_name"])
 
-        topics = " · ".join((d.get("topics") or [])[:10])
-        why = html.escape(d["why"] or "관심분야 기반")
-        desc = html.escape(d["description"] or "설명 없음")
+        topics = " · ".join((data.get("topics") or [])[:10])
+        why = html.escape(data["why"] or self.t("interest_based"))
+        desc = html.escape(data["description"] or self.t("description_missing"))
         topics_html = html.escape(topics)
+        compat_reason = html.escape(assessment.get("reason") or "")
         self.detail.setHtml(
-            f'<b style="color:#DCE6FF">Why it fits</b>  {why}'
+            f'<b style="color:#DCE6FF">{html.escape(self.t("why_it_fits"))}</b>  {why}'
             f'<br><span style="color:#BAC6D8">{desc}</span>'
+            f'<br><span style="color:#78A7FF">{html.escape(self.t("mac_check"))}: '
+            f'{compat_reason}</span>'
             f'<br><span style="color:#77849A">{topics_html}</span>'
         )
-        self.save_btn.setText("★ Saved" if d["favorite"] else "☆ Save")
+
+        install_bits = [
+            self.t(
+                "estimated_usage",
+                size=format_bytes(assessment.get("estimated_bytes")),
+            ),
+            self.t(
+                "free_space",
+                size=format_bytes(assessment.get("free_bytes")),
+            ),
+        ]
+        if assessment.get("release_size"):
+            install_bits.insert(
+                0,
+                self.t(
+                    "download_size",
+                    size=format_bytes(assessment.get("release_size")),
+                ),
+            )
+        if assessment.get("installed_path"):
+            install_bits.append(
+                self.t("installed_path", path=assessment.get("installed_path"))
+            )
+        else:
+            install_bits.append(
+                self.t(
+                    "install_destination",
+                    path=os.path.expanduser(
+                        self.settings.get("install_root") or "~/Applications/H2S Tools"
+                    ),
+                )
+            )
+        self.install_info.setText("  ·  ".join(install_bits))
+
+        self.save_btn.setText(
+            self.t("saved_button") if data["favorite"] else self.t("save_button")
+        )
+
+        if assessment.get("installed") and assessment.get("installed_path"):
+            self.install_btn.setEnabled(True)
+            self.install_btn.setText(self.t("open_installed"))
+            self.install_btn.setToolTip(assessment.get("installed_path"))
+            return
+
+        if assessment.get("status") == "blocked":
+            self.install_btn.setEnabled(False)
+            self.install_btn.setText(self.t("install_incompatible"))
+            self.install_btn.setToolTip(assessment.get("reason") or "")
+            return
+
+        cached = self._cached_release_info(data)
+        if cached and cached.get("compatible") and cached.get("asset_url"):
+            self.current_release_info = cached
+            self.install_btn.setEnabled(True)
+            self.install_btn.setText(
+                self.t(
+                    "easy_install",
+                    size=format_bytes(cached.get("asset_size")),
+                )
+            )
+            self.install_btn.setToolTip(cached.get("asset_name") or "")
+            return
+
+        if cached and self._release_check_is_fresh(data):
+            self.install_btn.setEnabled(False)
+            self.install_btn.setText(self.t("install_unavailable"))
+            self.install_btn.setToolTip(cached.get("reason") or "")
+            return
+
+        self.install_btn.setEnabled(False)
+        self.install_btn.setText(self.t("install_checking"))
+        self.install_btn.setToolTip(self.t("install_checking_tip"))
+        self.start_release_probe(repo_id, data)
+
+    def start_release_probe(self, repo_id, data):
+        if self.probe_worker and self.probe_worker.isRunning():
+            return
+        self.probe_worker = ReleaseProbeWorker(
+            repo_id, data, dict(self.profile), self
+        )
+        self.probe_worker.done.connect(self.release_probe_done)
+        self.probe_worker.failed.connect(self.release_probe_failed)
+        self.probe_worker.start()
+
+    def release_probe_done(self, repo_id, info):
+        reason = (info.get("reason") or "").lower()
+        if "rate limit" not in reason:
+            update_release_info(repo_id, info)
+
+        current = self.current_id()
+        self.profile = mac_profile()
+        if current == repo_id:
+            self.load_items()
+            self.select_repo_id(repo_id)
+            self.show_selected()
+        else:
+            QTimer.singleShot(80, self.show_selected)
+
+    def release_probe_failed(self, repo_id, message):
+        if self.current_id() == repo_id:
+            self.install_btn.setEnabled(False)
+            self.install_btn.setText(self.t("install_unavailable"))
+            self.install_btn.setToolTip(message)
+        else:
+            QTimer.singleShot(80, self.show_selected)
+
+    def select_repo_id(self, repo_id):
+        for row, value in self.row_ids.items():
+            if value == repo_id:
+                self.table.selectRow(row)
+                return True
+        return False
+
+    def install_or_open(self):
+        repo_id = self.current_id()
+        if not repo_id:
+            return
+        data = repo_by_id(repo_id)
+        if not data:
+            return
+        assessment = assess_repo(data, self.profile)
+
+        if assessment.get("installed") and assessment.get("installed_path"):
+            path = assessment.get("installed_path")
+            subprocess.Popen(["/usr/bin/open", path])
+            return
+
+        release_info = self.current_release_info or self._cached_release_info(data)
+        if (
+            assessment.get("status") == "blocked"
+            or not release_info
+            or not release_info.get("compatible")
+            or not release_info.get("asset_url")
+        ):
+            return
+
+        self.install_btn.setEnabled(False)
+        self.install_btn.setText(self.t("installing"))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.show()
+
+        self.install_worker = InstallWorker(
+            repo_id, data, release_info, self
+        )
+        self.install_worker.progress.connect(self.install_progress)
+        self.install_worker.done.connect(self.install_done)
+        self.install_worker.failed.connect(self.install_failed)
+        self.install_worker.start()
+
+    def install_progress(self, value):
+        self.progress.setValue(int(value))
+        self.status.setText(self.t("install_progress", percent=int(value)))
+
+    def install_done(self, repo_id, result):
+        self.progress.hide()
+        if result.get("pending_system_installer"):
+            self.status.setText(self.t("system_installer_opened"))
+            self.install_btn.setText(self.t("finish_system_installer"))
+            self.install_btn.setEnabled(False)
+            return
+
+        path = result.get("path") or ""
+        set_managed_install(
+            repo_id,
+            path,
+            result.get("version") or "",
+            result.get("bytes") or 0,
+        )
+        self.profile = mac_profile()
+        self.status.setText(
+            self.t(
+                "install_complete",
+                size=format_bytes(result.get("bytes")),
+            )
+        )
+        self.load_items()
+        self.select_repo_id(repo_id)
+        self.show_selected()
+        QTimer.singleShot(250, self.show_quick_start)
+
+    def install_failed(self, repo_id, message):
+        self.progress.hide()
+        self.status.setText(self.t("install_failed"))
+        self.install_btn.setEnabled(True)
+        self.install_btn.setText(self.t("easy_install", size=""))
+        QMessageBox.warning(
+            self,
+            self.t("install_failed"),
+            message,
+        )
+
+    def show_quick_start(self):
+        repo_id = self.current_id()
+        if not repo_id:
+            return
+        data = repo_by_id(repo_id)
+        if not data:
+            return
+        key = {
+            "작곡·음악 생성": "quick_start_music",
+            "DAW 자동화": "quick_start_daw",
+            "Audio→MIDI·채보": "quick_start_midi",
+            "Stem·오디오 분리": "quick_start_stem",
+            "보컬·가창 합성": "quick_start_vocal",
+            "Agent·MCP": "quick_start_agent",
+            "로컬 LLM": "quick_start_agent",
+        }.get(data.get("category"), "quick_start_generic")
+        QMessageBox.information(
+            self,
+            self.t("quick_start_title"),
+            f'{data.get("name") or data.get("full_name")}\n\n{self.t(key)}',
+        )
 
     def open_selected(self, *_):
         repo_id = self.current_id()
         if repo_id:
-            d = repo_by_id(repo_id)
-            if d:
-                webbrowser.open(d["html_url"])
+            data = repo_by_id(repo_id)
+            if data:
+                webbrowser.open(data["html_url"])
 
     def toggle_save(self):
         repo_id = self.current_id()
         if not repo_id:
             return
-        d = repo_by_id(repo_id)
-        set_favorite(repo_id, not bool(d["favorite"]))
+        data = repo_by_id(repo_id)
+        set_favorite(repo_id, not bool(data["favorite"]))
         self.load_items()
 
     def hide_selected(self):
@@ -639,8 +1219,8 @@ class MainWindow(QMainWindow):
         if remaining <= 0:
             self.refresh(True)
         else:
-            mins = max(1, int(remaining / 60))
-            self.status.setText(f"Using cache · next scan in ~{mins} min")
+            minutes = max(1, int(remaining / 60))
+            self.status.setText(self.t("using_cache", minutes=minutes))
 
     def refresh(self, silent=False):
         if self.worker and self.worker.isRunning():
@@ -653,25 +1233,30 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.show()
         self.refresh_btn.setEnabled(False)
-        self.refresh_btn.setText("Scanning…")
+        self.refresh_btn.setText(self.t("scanning"))
         self.worker.start()
 
     def on_progress(self, current, total, message):
         self.progress.setRange(0, total)
         self.progress.setValue(current)
-        self.status.setText(f"Scanning {current}/{total} · {message}")
+        self.status.setText(
+            self.t("scan_progress", current=current, total=total, message=message)
+        )
 
     def on_done(self, result, silent):
         self.progress.hide()
         self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Refresh radar")
-        errors = result.get("errors") or []
+        self.refresh_btn.setText(self.t("refresh"))
 
-        self.status.setText(
-            f'Updated · {result.get("found", 0)} analyzed · '
-            f'{result.get("new", 0)} new'
-            + (f' · {len(errors)} warning(s)' if errors else "")
+        errors = result.get("errors") or []
+        status = self.t(
+            "scan_done",
+            found=result.get("found", 0),
+            new=result.get("new", 0),
         )
+        if errors:
+            status += self.t("warning_count", count=len(errors))
+        self.status.setText(status)
 
         if int(result.get("found", 0) or 0) > 0:
             self.settings["last_scan_epoch"] = time.time()
@@ -684,18 +1269,20 @@ class MainWindow(QMainWindow):
         if top:
             first = top[0]
             self.notify(
-                "새 AI 오픈소스 추천",
-                f'{first["name"]} · 추천 {first["score"]} · {first["why"]}'
+                self.t("new_notification"),
+                f'{first["name"]} · {self.t("recommendation", score=first["score"])} · {first["why"]}'
             )
 
         if errors and not silent:
-            QMessageBox.warning(self, "탐색 일부 실패", "\n".join(errors[:3]))
+            QMessageBox.warning(
+                self, self.t("scan_warning_title"), "\n".join(errors[:3])
+            )
 
     def on_failed(self, message):
         self.progress.hide()
         self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Refresh radar")
-        self.status.setText("Scan failed")
+        self.refresh_btn.setText(self.t("refresh"))
+        self.status.setText(self.t("scan_failed"))
         QMessageBox.warning(self, APP_NAME, message)
 
     def notify(self, title, message):
@@ -703,8 +1290,10 @@ class MainWindow(QMainWindow):
             title = title.replace('"', "'")
             message = message.replace('"', "'")
             subprocess.run(
-                ["osascript", "-e",
-                 f'display notification "{message}" with title "{title}"'],
+                [
+                    "osascript", "-e",
+                    f'display notification "{message}" with title "{title}"'
+                ],
                 timeout=4
             )
         except Exception:
@@ -712,10 +1301,10 @@ class MainWindow(QMainWindow):
 
     def sample_context(self):
         if not self.settings.get("context_monitoring", True):
-            self.context_side.setText("Context monitoring is off")
+            self.context_side.setText(self.t("context_off"))
             return
         name = sample_activity()
-        self.context_side.setText(name or "No matching creative app detected")
+        self.context_side.setText(name or self.t("context_none"))
 
     def scan_files(self):
         if self.settings.get("context_monitoring", True):
@@ -745,25 +1334,43 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def settings_saved(self, data):
+        old_lang = self.lang
         self.settings = data
+        self.lang = normalize_language(data.get("language", "en"))
+
         self.refresh_timer.start(
             max(1, int(data.get("auto_refresh_hours", 6))) * 60 * 60 * 1000
         )
         sync_login_item(bool(data.get("start_at_login", True)))
-        self.sample_context()
+
         rescore_cached()
+
+        if self.lang != old_lang:
+            QTimer.singleShot(200, self.restart_app)
+            return
+
+        self.sample_context()
         self.load_items()
-        self.status.setText("Preferences saved · scores recalculated")
+        self.status.setText(self.t("preferences_saved"))
+
+    def restart_app(self):
+        try:
+            if getattr(sys, "frozen", False):
+                bundle = Path(sys.executable).resolve().parents[2]
+                subprocess.Popen(["/usr/bin/open", "-n", str(bundle)])
+            else:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve())])
+        finally:
+            QApplication.quit()
 
     def setup_tray(self):
-        icon = app_icon()
-        self.tray = QSystemTrayIcon(icon, self)
+        self.tray = QSystemTrayIcon(app_icon(), self)
 
         menu = QMenu()
-        show = QAction("Open Source Radar 열기", self)
-        refresh = QAction("지금 추천 갱신", self)
-        site = QAction("H2S Studio 열기", self)
-        quit_action = QAction("종료", self)
+        show = QAction(self.t("tray_open"), self)
+        refresh = QAction(self.t("tray_refresh"), self)
+        site = QAction(self.t("tray_site"), self)
+        quit_action = QAction(self.t("tray_quit"), self)
 
         show.triggered.connect(self.show_normal)
         refresh.triggered.connect(lambda: self.refresh(False))
@@ -793,7 +1400,7 @@ class MainWindow(QMainWindow):
         self.hide()
         self.tray.showMessage(
             APP_NAME,
-            "백그라운드에서 추천을 계속 확인합니다.",
+            self.t("background_message"),
             QSystemTrayIcon.Information,
             1800,
         )
@@ -851,6 +1458,22 @@ class MainWindow(QMainWindow):
             border: 1px solid #223149;
             border-radius: 12px;
         }
+        #filterPanel {
+            background: #0F1824;
+            border: 1px solid #203047;
+            border-radius: 11px;
+        }
+        QPushButton#filterToggle {
+            background: transparent;
+            border: 1px solid #27364C;
+            color: #9AA8BC;
+            padding: 6px 10px;
+        }
+        QPushButton#filterToggle:checked {
+            background: #16263F;
+            color: #DDE7F8;
+            border-color: #385780;
+        }
         #liveDot {
             color: #67D8A5;
             font-size: 10px;
@@ -858,7 +1481,6 @@ class MainWindow(QMainWindow):
         #contextText {
             color: #C6D1E1;
             font-size: 11px;
-            line-height: 1.3;
         }
         #privacyMini {
             color: #66768E;
@@ -899,8 +1521,20 @@ class MainWindow(QMainWindow):
             color: white;
             font-weight: 760;
         }
-        QPushButton#primary:hover {
-            background: #6985FA;
+        QPushButton#primary:hover { background: #6985FA; }
+        QPushButton#installPrimary {
+            background: #356CE8;
+            border-color: #5485F2;
+            color: white;
+            font-weight: 800;
+        }
+        QPushButton#installPrimary:hover {
+            background: #477CF0;
+        }
+        QPushButton#installPrimary:disabled {
+            background: #172131;
+            border-color: #27364C;
+            color: #66768D;
         }
         QPushButton#website {
             text-align: left;
@@ -908,14 +1542,14 @@ class MainWindow(QMainWindow):
             background: #111A27;
             color: #8AA5FF;
         }
-        QLineEdit, QPlainTextEdit {
+        QLineEdit, QPlainTextEdit, QComboBox {
             background: #101824;
             border: 1px solid #27364C;
             border-radius: 9px;
             padding: 8px;
             selection-background-color: #536FE8;
         }
-        QLineEdit:focus, QPlainTextEdit:focus {
+        QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
             border-color: #5878D9;
         }
         QTableWidget {
@@ -974,6 +1608,22 @@ class MainWindow(QMainWindow):
             padding: 4px 8px;
             color: #BDD0FF;
             font-weight: 800;
+        }
+        #macBadge {
+            background: #132B27;
+            border: 1px solid #245B4C;
+            border-radius: 9px;
+            padding: 4px 8px;
+            color: #8FE1C4;
+            font-weight: 750;
+        }
+        #installInfo {
+            color: #8FA0B7;
+            font-size: 10px;
+            background: #0D1520;
+            border: 1px solid #1D2B3E;
+            border-radius: 8px;
+            padding: 7px 9px;
         }
         QTextBrowser {
             background: transparent;

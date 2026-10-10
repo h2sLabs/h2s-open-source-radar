@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#07142f"/><stop offset=".55" stop-color="#081d4c"/><stop offset="1" stop-color="#160a43"/></linearGradient>
+  <linearGradient id="neon" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#8ff7ff"/><stop offset=".45" stop-color="#3984ff"/><stop offset=".75" stop-color="#6352ff"/><stop offset="1" stop-color="#b064ff"/></linearGradient>
+  <linearGradient id="beam" x1="0" y1="1" x2="1" y2="0"><stop stop-color="#39d8ff" stop-opacity=".04"/><stop offset="1" stop-color="#89efff" stop-opacity=".68"/></linearGradient>
+  <filter id="glow"><feGaussianBlur stdDeviation="10" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <filter id="soft"><feGaussianBlur stdDeviation="22"/></filter>
+</defs>
+<rect x="36" y="36" width="952" height="952" rx="220" fill="url(#bg)" stroke="#598cff" stroke-width="10"/>
+<rect x="54" y="54" width="916" height="916" rx="205" fill="none" stroke="#66d7ff" stroke-opacity=".24" stroke-width="5"/>
+<circle cx="512" cy="512" r="160" fill="none" stroke="#3d75ff" stroke-opacity=".35" stroke-width="5"/>
+<circle cx="512" cy="512" r="270" fill="none" stroke="#4a79ff" stroke-opacity=".45" stroke-width="5"/>
+<circle cx="512" cy="512" r="380" fill="none" stroke="#4b82ff" stroke-opacity=".42" stroke-width="5"/>
+<path d="M512 512 L833 207 A380 380 0 0 1 890 282 Z" fill="url(#beam)" filter="url(#soft)"/>
+<path d="M512 512 L836 212" stroke="#baf8ff" stroke-width="8" stroke-linecap="round" filter="url(#glow)"/>
+<circle cx="836" cy="212" r="18" fill="#fff" filter="url(#glow)"/>
+<circle cx="836" cy="212" r="52" fill="none" stroke="#8e62ff" stroke-opacity=".35" stroke-width="4"/>
+<circle cx="320" cy="328" r="14" fill="#55b8ff" filter="url(#glow)"/>
+<circle cx="721" cy="761" r="16" fill="#805cff" filter="url(#glow)"/>
+<path d="M170 512 H854 M512 170 V854" stroke="#4285ff" stroke-opacity=".16" stroke-width="4"/>
+<text x="512" y="630" text-anchor="middle" font-family="Arial,Helvetica,sans-serif" font-size="350" font-weight="800" letter-spacing="-32" fill="url(#neon)" stroke="#bfefff" stroke-opacity=".72" stroke-width="3" paint-order="stroke" filter="url(#glow)">H2S</text>
+</svg>
