@@ -24,6 +24,7 @@ It was built with music and creative automation in mind, but also tracks agents/
 - **Advanced filters** for Mac-ready / one-click-ready / review / incompatible, installed state, estimated size, license family, update age, and minimum Stars.
 - **H2S Easy Install** enables the install button only after a compatible official GitHub release asset has been verified. ZIP/TAR/DMG installs stay inside the selected H2S Tools folder; PKG files open Apple's Installer for required system approval.
 - **Quick Start** appears after installation with a short category-specific 4-step guide.
+- **Korean description translation** runs in the background when the UI language is Korean. Public GitHub descriptions are translated with an H2S AI/music terminology glossary, cached locally, and refreshed automatically when the source description or glossary version changes.
 - Music-focused categories including Music Generation, DAW Automation, Audio → MIDI, Stem Separation, and Vocal Synthesis.
 - Optional background refresh with a local cache to avoid unnecessary GitHub API calls.
 - macOS menu-bar presence and login launch.
