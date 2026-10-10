@@ -53,12 +53,12 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='H2S Open Source Radar.app',
-    icon=str(project / 'assets' / 'H2SOpenSourceRadar.icns'),
+    icon=str(project / 'assets' / 'H2SOpenSourceRadarV2.icns'),
     bundle_identifier='com.h2sstudio.opensource-radar',
     info_plist={
         'CFBundleDisplayName': 'H2S Open Source Radar',
         'CFBundleShortVersionString': '0.1.0',
-        'CFBundleVersion': '1',
+        'CFBundleVersion': '2',
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '13.0',
     },
